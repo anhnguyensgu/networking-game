@@ -19,6 +19,7 @@ DEFAULT_WORK_QUEUE_SIZE :: 8192
 RECV_BUFFER_SIZE :: 4096
 WORKER_IDLE_SLEEP :: 50 * time.Microsecond
 DEFAULT_IO_TICK_TIMEOUT_US :: -1
+DEFAULT_IO_QUIESCE_ROUNDS :: 8
 DEFAULT_METRICS_INTERVAL_MS :: 1000
 DEFAULT_PROFILE_PATH :: "profiles/server.spall"
 PROFILE_BUFFER_SIZE :: 64 * 1024
@@ -30,6 +31,7 @@ Server_Options :: struct {
 	io_threads:   int    `args:"name=io-threads" usage:"Number of IO event-loop threads for accepted clients."`,
 	queue_size:   int    `args:"name=queue-size" usage:"Request work queue capacity per IO shard."`,
 	io_tick_timeout_us: int `args:"name=io-tick-timeout-us" usage:"IO loop tick timeout in microseconds. -1 blocks until socket or explicit wake."`,
+	io_quiesce_rounds: int `args:"name=io-quiesce-rounds" usage:"Maximum non-blocking IO drain rounds after each blocking tick. Zero disables quiescing."`,
 	steal_work:   bool   `args:"name=steal-work" usage:"Allow idle workers to scan other IO queues for work."`,
 	metrics:      bool   `usage:"Log per-IO useful/empty tick metrics."`,
 	metrics_ms:   int    `args:"name=metrics-ms" usage:"Per-IO metrics log interval in milliseconds."`,
@@ -60,6 +62,7 @@ IO_Thread_State :: struct {
 	index: int,
 	loop: ^nbio.Event_Loop,
 	tick_timeout: time.Duration,
+	quiesce_rounds: int,
 	work_sender: chan.Chan(^Work_Item, .Send),
 	accepted_sender: chan.Chan(^Accepted_Client, .Send),
 	accepted_receiver: chan.Chan(^Accepted_Client, .Recv),
@@ -79,6 +82,7 @@ IO_Thread_State :: struct {
 IO_Metrics :: struct {
 	total_ticks: int,
 	empty_ticks: int,
+	quiesce_rounds: int,
 	wake_events: int,
 	accepted_drained: int,
 	responses_drained: int,
@@ -179,6 +183,7 @@ main :: proc() {
 		io_threads         = DEFAULT_IO_THREAD_COUNT,
 		queue_size         = DEFAULT_WORK_QUEUE_SIZE,
 		io_tick_timeout_us = DEFAULT_IO_TICK_TIMEOUT_US,
+		io_quiesce_rounds  = DEFAULT_IO_QUIESCE_ROUNDS,
 		metrics_ms         = DEFAULT_METRICS_INTERVAL_MS,
 		profile_path       = DEFAULT_PROFILE_PATH,
 	}
@@ -189,6 +194,9 @@ main :: proc() {
 	}
 	if options.io_tick_timeout_us < -1 {
 		log.panic("io-tick-timeout-us must be -1 or greater")
+	}
+	if options.io_quiesce_rounds < 0 {
+		log.panic("io-quiesce-rounds must be zero or greater")
 	}
 	if options.profile {
 		when SPALL_PROFILE {
@@ -316,6 +324,7 @@ main :: proc() {
 		io_threads[i] = IO_Thread_State {
 			index = i,
 			tick_timeout = tick_timeout,
+			quiesce_rounds = options.io_quiesce_rounds,
 			work_sender = work_queues[i].sender,
 			accepted_sender = chan.as_send(accepted_channels[i]),
 			accepted_receiver = chan.as_recv(accepted_channels[i]),
@@ -362,6 +371,8 @@ main :: proc() {
 		len(work_queues),
 		"io_tick_timeout_us",
 		options.io_tick_timeout_us,
+		"io_quiesce_rounds",
+		options.io_quiesce_rounds,
 		"steal_work",
 		options.steal_work,
 	)
@@ -411,25 +422,41 @@ io_thread_proc :: proc(state: ^IO_Thread_State) {
 	log.info("io thread started:", state.index)
 	state.metrics_last_tick = time.tick_now()
 	for {
-		before_progress := io_metrics_progress(state)
-		drain_io_thread_queues(state)
-		when SPALL_PROFILE {
-			profile_begin("io.tick")
-		}
-		err := nbio.tick(state.tick_timeout)
-		when SPALL_PROFILE {
-			profile_end()
-		}
-		if err != nil {
-			log.panic("io event loop tick failed:", state.index, err)
-		}
-		drain_io_thread_queues(state)
-		after_progress := io_metrics_progress(state)
-		state.metrics.total_ticks += 1
-		if after_progress == before_progress {
-			state.metrics.empty_ticks += 1
-		}
+		tick_io_thread(state, state.tick_timeout)
+		drain_io_to_quiescence(state)
 		maybe_log_io_metrics(state)
+	}
+}
+
+tick_io_thread :: proc(io_thread: ^IO_Thread_State, timeout: time.Duration) -> bool {
+	before_progress := io_metrics_progress(io_thread)
+	drain_io_thread_queues(io_thread)
+	when SPALL_PROFILE {
+		profile_begin("io.tick")
+	}
+	err := nbio.tick(timeout)
+	when SPALL_PROFILE {
+		profile_end()
+	}
+	if err != nil {
+		log.panic("io event loop tick failed:", io_thread.index, err)
+	}
+	drain_io_thread_queues(io_thread)
+	after_progress := io_metrics_progress(io_thread)
+	io_thread.metrics.total_ticks += 1
+	if after_progress == before_progress {
+		io_thread.metrics.empty_ticks += 1
+		return false
+	}
+	return true
+}
+
+drain_io_to_quiescence :: proc(io_thread: ^IO_Thread_State) {
+	for _ in 0 ..< io_thread.quiesce_rounds {
+		if !tick_io_thread(io_thread, 0) {
+			return
+		}
+		io_thread.metrics.quiesce_rounds += 1
 	}
 }
 
@@ -709,6 +736,8 @@ maybe_log_io_metrics :: proc(io_thread: ^IO_Thread_State) {
 		useful_ticks,
 		"empty_ticks",
 		m.empty_ticks,
+		"quiesce_rounds",
+		m.quiesce_rounds,
 		"useful_pct",
 		useful_pct,
 		"requests_per_tick",
