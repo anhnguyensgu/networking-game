@@ -6,16 +6,24 @@ import "core:log"
 import "core:nbio"
 import "core:net"
 import "core:os"
+import "core:prof/spall"
+import "core:sync"
 import "core:sync/chan"
 import "core:thread"
 
 DEFAULT_WORKER_COUNT :: 14
 DEFAULT_WORK_QUEUE_SIZE :: 256
 RECV_BUFFER_SIZE :: 4096
+DEFAULT_PROFILE_PATH :: "profiles/server.spall"
+PROFILE_BUFFER_SIZE :: 64 * 1024
+PROFILE_FLUSH_EVENTS :: 512
+SPALL_PROFILE :: #config(SPALL_PROFILE, false)
 
 Server_Options :: struct {
-	workers:    int `usage:"Number of request worker threads."`,
-	queue_size: int `args:"name=queue-size" usage:"Request work queue capacity."`,
+	workers:      int    `usage:"Number of request worker threads."`,
+	queue_size:   int    `args:"name=queue-size" usage:"Request work queue capacity."`,
+	profile:      bool   `usage:"Write a Spall trace. Requires build with -define:SPALL_PROFILE=true."`,
+	profile_path: string `args:"name=profile-path" usage:"Spall trace output path."`,
 }
 
 Server_State :: struct {
@@ -47,6 +55,13 @@ Response_Item :: struct {
 	data: []byte,
 }
 
+when SPALL_PROFILE {
+	profile_ctx: spall.Context
+	profile_active: bool
+	@(thread_local) profile_buffer: spall.Buffer
+	@(thread_local) profile_event_count: int
+}
+
 ENEMY_BASES := []shared.Enemy_Base_View {
 	{id = 1, x = 180, y = 160, level = 2, name = "Stone Reef"},
 	{id = 2, x = 420, y = 260, level = 4, name = "Iron Cove"},
@@ -57,13 +72,22 @@ ENEMY_BASES := []shared.Enemy_Base_View {
 main :: proc() {
 	context.logger = log.create_console_logger()
 	options := Server_Options {
-		workers    = DEFAULT_WORKER_COUNT,
-		queue_size = DEFAULT_WORK_QUEUE_SIZE,
+		workers      = DEFAULT_WORKER_COUNT,
+		queue_size   = DEFAULT_WORK_QUEUE_SIZE,
+		profile_path = DEFAULT_PROFILE_PATH,
 	}
 	flags.parse_or_exit(&options, os.args, .Unix)
 
 	if options.workers <= 0 || options.queue_size <= 0 {
 		log.panic("workers and queue-size must be greater than zero")
+	}
+	if options.profile {
+		when SPALL_PROFILE {
+			profile_start(options.profile_path)
+			_ = profile_thread_start("io event loop")
+		} else {
+			log.panic("profile requested, but server was built without -define:SPALL_PROFILE=true")
+		}
 	}
 
 	endpoint := net.Endpoint {
@@ -112,13 +136,29 @@ main :: proc() {
 	nbio.accept_poly(listener, &state, on_accept)
 
 	for {
-		if err := nbio.tick(); err != nil {
+		when SPALL_PROFILE {
+			profile_begin("io.tick")
+		}
+		err := nbio.tick()
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil {
 			log.panic("event loop tick failed:", err)
 		}
 	}
 }
 
 on_accept :: proc(op: ^nbio.Operation, state: ^Server_State) {
+	when SPALL_PROFILE {
+		profile_begin("io.accept")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	if op.accept.err != nil {
 		log.warn("accept failed:", op.accept.err)
 		nbio.accept_poly(op.accept.socket, state, on_accept)
@@ -141,19 +181,35 @@ on_accept :: proc(op: ^nbio.Operation, state: ^Server_State) {
 }
 
 work_worker :: proc(index: int, jobs: chan.Chan(^Work_Item, .Recv)) {
+	when SPALL_PROFILE {
+		_ = profile_thread_start("request worker")
+	}
+
 	log.info("request worker started:", index)
 	for {
+		when SPALL_PROFILE {
+			profile_begin("worker.recv_wait")
+		}
 		work, ok := chan.recv(jobs)
+		when SPALL_PROFILE {
+			profile_end()
+		}
 		if !ok {
 			return
 		}
 
+		when SPALL_PROFILE {
+			profile_begin("worker.process")
+		}
 		response := new(Response_Item)
 		response.connection = work.connection
 		response.data = process_request(work.line)
 
 		delete(work.line)
 		free(work)
+		when SPALL_PROFILE {
+			profile_end()
+		}
 
 		nbio.next_tick_poly(response, on_response_ready, l=response.connection.loop)
 	}
@@ -167,6 +223,15 @@ schedule_recv :: proc(connection: ^Connection) {
 }
 
 on_recv :: proc(op: ^nbio.Operation, connection: ^Connection) {
+	when SPALL_PROFILE {
+		profile_begin("io.recv")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	if connection.closed {
 		return
 	}
@@ -188,6 +253,15 @@ on_recv :: proc(op: ^nbio.Operation, connection: ^Connection) {
 }
 
 append_received_bytes :: proc(connection: ^Connection, data: []byte) -> bool {
+	when SPALL_PROFILE {
+		profile_begin("io.parse_lines")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	for b in data {
 		if b == '\n' {
 			line := make([]byte, connection.line_len)
@@ -207,6 +281,15 @@ append_received_bytes :: proc(connection: ^Connection, data: []byte) -> bool {
 }
 
 dispatch_next_line :: proc(connection: ^Connection) {
+	when SPALL_PROFILE {
+		profile_begin("queue.dispatch")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	if connection.closed || connection.busy || len(connection.pending_lines) == 0 {
 		return
 	}
@@ -226,7 +309,22 @@ dispatch_next_line :: proc(connection: ^Connection) {
 }
 
 process_request :: proc(line: []byte) -> []byte {
+	when SPALL_PROFILE {
+		profile_begin("request.process")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
+	when SPALL_PROFILE {
+		profile_begin("json.decode_envelope")
+	}
 	envelope, err := shared.decode_envelope(line)
+	when SPALL_PROFILE {
+		profile_end()
+	}
 	if err != nil {
 		return encode_json_line(shared.make_error_response(0, "invalid JSON message"))
 	}
@@ -234,14 +332,28 @@ process_request :: proc(line: []byte) -> []byte {
 	#partial switch envelope.kind {
 	case .Get_World_Map:
 		request: shared.Get_World_Map_Request
-		if err := shared.decode_json(line, &request); err != nil {
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil {
 			return encode_json_line(shared.make_error_response(envelope.seq, "invalid world map request"))
 		}
 		return encode_json_line(shared.make_world_map_response(request.seq, ENEMY_BASES))
 
 	case .Select_Base:
 		request: shared.Select_Base_Request
-		if err := shared.decode_json(line, &request); err != nil {
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil {
 			return encode_json_line(shared.make_error_response(envelope.seq, "invalid select base request"))
 		}
 		return encode_json_line(shared.make_error_response(request.seq, "battle screen is not implemented yet"))
@@ -252,6 +364,15 @@ process_request :: proc(line: []byte) -> []byte {
 }
 
 encode_json_line :: proc(message: any) -> []byte {
+	when SPALL_PROFILE {
+		profile_begin("json.encode_line")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	data, err := shared.encode_json(message)
 	if err != nil {
 		return nil
@@ -265,6 +386,15 @@ encode_json_line :: proc(message: any) -> []byte {
 }
 
 on_response_ready :: proc(op: ^nbio.Operation, response: ^Response_Item) {
+	when SPALL_PROFILE {
+		profile_begin("io.response_ready")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	connection := response.connection
 	if connection.closed || response.data == nil {
 		delete(response.data)
@@ -279,6 +409,15 @@ on_response_ready :: proc(op: ^nbio.Operation, response: ^Response_Item) {
 }
 
 on_sent :: proc(op: ^nbio.Operation, response: ^Response_Item) {
+	when SPALL_PROFILE {
+		profile_begin("io.sent")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	connection := response.connection
 	delete(response.data)
 	free(response)
@@ -300,6 +439,15 @@ on_sent :: proc(op: ^nbio.Operation, response: ^Response_Item) {
 }
 
 close_connection :: proc(connection: ^Connection) {
+	when SPALL_PROFILE {
+		profile_begin("io.close")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
 	if connection == nil || connection.closed {
 		return
 	}
@@ -312,4 +460,80 @@ close_connection :: proc(connection: ^Connection) {
 	nbio.close(connection.socket)
 	log.info("client disconnected")
 	free(connection)
+}
+
+when SPALL_PROFILE {
+	profile_start :: proc(path: string) {
+		if path == "" {
+			log.panic("profile-path cannot be empty")
+		}
+		if err := os.make_directory_all("profiles"); err != nil && err != .Exist {
+			log.panic("profile directory create failed:", err)
+		}
+
+		ctx, ok := spall.context_create_with_scale(path, false, 1)
+		if !ok {
+			log.panic("spall context create failed:", path)
+		}
+
+		profile_ctx = ctx
+		profile_active = true
+		log.info("spall profiling enabled:", path)
+	}
+
+	profile_stop :: proc() {
+		if !profile_active {
+			return
+		}
+
+		spall.context_destroy(&profile_ctx)
+		profile_active = false
+	}
+
+	profile_thread_start :: proc(name: string) -> []byte {
+		if !profile_active {
+			return nil
+		}
+
+		backing := make([]byte, PROFILE_BUFFER_SIZE)
+		buffer, ok := spall.buffer_create(backing, u32(sync.current_thread_id()))
+		if !ok {
+			log.panic("spall buffer create failed")
+		}
+
+		profile_buffer = buffer
+		profile_event_count = 0
+		spall._buffer_name_thread(&profile_ctx, &profile_buffer, name)
+		return backing
+	}
+
+	profile_thread_stop :: proc(backing: []byte) {
+		if !profile_active || len(profile_buffer.data) == 0 {
+			return
+		}
+
+		spall.buffer_destroy(&profile_ctx, &profile_buffer)
+		profile_buffer = spall.Buffer{}
+		profile_event_count = 0
+		if len(backing) > 0 {
+			delete(backing)
+		}
+	}
+
+	profile_begin :: proc(name: string) {
+		if profile_active && len(profile_buffer.data) > 0 {
+			spall._buffer_begin(&profile_ctx, &profile_buffer, name)
+		}
+	}
+
+	profile_end :: proc() {
+		if profile_active && len(profile_buffer.data) > 0 {
+			spall._buffer_end(&profile_ctx, &profile_buffer)
+			profile_event_count += 1
+			if profile_event_count >= PROFILE_FLUSH_EVENTS {
+				spall.buffer_flush(&profile_ctx, &profile_buffer)
+				profile_event_count = 0
+			}
+		}
+	}
 }
