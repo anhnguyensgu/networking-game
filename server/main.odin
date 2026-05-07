@@ -3,6 +3,7 @@ package main
 import shared "../shared"
 import "core:log"
 import "core:net"
+import "core:thread"
 
 ENEMY_BASES := []shared.Enemy_Base_View {
 	{id = 1, x = 180, y = 160, level = 2, name = "Stone Reef"},
@@ -32,7 +33,18 @@ main :: proc() {
 			continue
 		}
 
-		handle_client(client, source)
+		t := thread.create_and_start_with_poly_data2(
+			client,
+			source,
+			handle_client,
+			context,
+			.Normal,
+			true,
+		)
+		if t == nil {
+			log.warn("failed to spawn client thread:", source)
+			net.close(client)
+		}
 	}
 }
 
