@@ -181,6 +181,16 @@ request_worker_proc :: proc(t: ^thread.Thread) {
 }
 
 run_request_worker :: proc(worker: ^Request_Worker) -> (ok, failed, dial_failed: int) {
+	socket, dial_err := net.dial_tcp(shared.SERVER_ADDRESS)
+	if dial_err != nil {
+		return 0, 1, 1
+	}
+	defer net.close(socket)
+
+	timeout := time.Duration(worker.timeout_ms) * time.Millisecond
+	_ = net.set_option(socket, .Receive_Timeout, timeout)
+	_ = net.set_option(socket, .Send_Timeout, timeout)
+
 	started := time.tick_now()
 	request_index := 0
 	for time.tick_since(started) < worker.duration {
@@ -189,15 +199,12 @@ run_request_worker :: proc(worker: ^Request_Worker) -> (ok, failed, dial_failed:
 		}
 
 		seq := u64(worker.index + 1) * 1_000_000_000 + u64(request_index + 1)
-		request_ok, request_dial_failed := run_single_request(seq, worker.timeout_ms)
+		request_ok := run_request(socket, seq)
 		if request_ok {
 			ok += 1
 		} else {
 			failed += 1
-			if request_dial_failed {
-				dial_failed += 1
-			}
-			time.sleep(1 * time.Millisecond)
+			break
 		}
 
 		request_index += 1
@@ -206,38 +213,28 @@ run_request_worker :: proc(worker: ^Request_Worker) -> (ok, failed, dial_failed:
 	return
 }
 
-run_single_request :: proc(seq: u64, timeout_ms: int) -> (ok, dial_failed: bool) {
-	socket, dial_err := net.dial_tcp(shared.SERVER_ADDRESS)
-	if dial_err != nil {
-		return false, true
-	}
-	defer net.close(socket)
-
-	timeout := time.Duration(timeout_ms) * time.Millisecond
-	_ = net.set_option(socket, .Receive_Timeout, timeout)
-	_ = net.set_option(socket, .Send_Timeout, timeout)
-
+run_request :: proc(socket: net.TCP_Socket, seq: u64) -> bool {
 	request := shared.make_get_world_map_request(seq)
 	if !shared.send_json_line(socket, request) {
-		return false, false
+		return false
 	}
 
 	line_buf: [shared.MAX_LINE_BYTES]byte
 	line, read_ok := shared.read_json_line(socket, line_buf[:])
 	if !read_ok {
-		return false, false
+		return false
 	}
 
 	envelope, envelope_err := shared.decode_envelope(line)
 	if envelope_err != nil || envelope.kind != .World_Map || envelope.seq != seq {
-		return false, false
+		return false
 	}
 
 	response: shared.World_Map_Response
 	if err := shared.decode_json(line, &response); err != nil {
-		return false, false
+		return false
 	}
 	shared.destroy_world_map_response(&response)
 
-	return true, false
+	return true
 }
