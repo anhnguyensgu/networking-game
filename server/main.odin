@@ -1,9 +1,25 @@
 package main
 
 import shared "../shared"
+import "core:flags"
 import "core:log"
 import "core:net"
+import "core:os"
+import "core:sync/chan"
 import "core:thread"
+
+DEFAULT_CLIENT_WORKER_COUNT :: 14
+DEFAULT_CLIENT_QUEUE_SIZE :: 256
+
+Server_Options :: struct {
+	workers:    int `usage:"Number of client worker threads."`,
+	queue_size: int `args:"name=queue-size" usage:"Accepted-client queue capacity."`,
+}
+
+Accepted_Client :: struct {
+	socket: net.TCP_Socket,
+	source: net.Endpoint,
+}
 
 ENEMY_BASES := []shared.Enemy_Base_View {
 	{id = 1, x = 180, y = 160, level = 2, name = "Stone Reef"},
@@ -14,6 +30,16 @@ ENEMY_BASES := []shared.Enemy_Base_View {
 
 main :: proc() {
 	context.logger = log.create_console_logger()
+	options := Server_Options {
+		workers    = DEFAULT_CLIENT_WORKER_COUNT,
+		queue_size = DEFAULT_CLIENT_QUEUE_SIZE,
+	}
+	flags.parse_or_exit(&options, os.args, .Unix)
+
+	if options.workers <= 0 || options.queue_size <= 0 {
+		log.panic("workers and queue-size must be greater than zero")
+	}
+
 	endpoint := net.Endpoint {
 		address = net.IP4_Loopback,
 		port    = shared.SERVER_PORT,
@@ -24,7 +50,29 @@ main :: proc() {
 	}
 	defer net.close(listener)
 
-	log.info("server listening on", shared.SERVER_ADDRESS)
+	log.info("server listening on", shared.SERVER_ADDRESS, "workers", options.workers, "queue_size", options.queue_size)
+
+	client_queue, queue_err := chan.create_buffered(chan.Chan(Accepted_Client), options.queue_size, context.allocator)
+	if queue_err != .None {
+		log.panic("client queue create failed:", queue_err)
+	}
+	defer chan.destroy(client_queue)
+	client_sender := chan.as_send(client_queue)
+	client_receiver := chan.as_recv(client_queue)
+
+	for i in 0 ..< options.workers {
+		t := thread.create_and_start_with_poly_data2(
+			i,
+			client_receiver,
+			client_worker,
+			context,
+			.Normal,
+			true,
+		)
+		if t == nil {
+			log.panic("failed to start client worker:", i)
+		}
+	}
 
 	for {
 		client, source, accept_err := net.accept_tcp(listener)
@@ -33,18 +81,22 @@ main :: proc() {
 			continue
 		}
 
-		t := thread.create_and_start_with_poly_data2(
-			client,
-			source,
-			handle_client,
-			context,
-			.Normal,
-			true,
-		)
-		if t == nil {
-			log.warn("failed to spawn client thread:", source)
+		if !chan.try_send(client_sender, Accepted_Client{socket = client, source = source}) {
+			log.warn("client queue full:", source)
 			net.close(client)
 		}
+	}
+}
+
+client_worker :: proc(index: int, clients: chan.Chan(Accepted_Client, .Recv)) {
+	log.info("client worker started:", index)
+	for {
+		client, ok := chan.recv(clients)
+		if !ok {
+			return
+		}
+
+		handle_client(client.socket, client.source)
 	}
 }
 
