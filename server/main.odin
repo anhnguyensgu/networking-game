@@ -12,7 +12,8 @@ import "core:sync/chan"
 import "core:thread"
 
 DEFAULT_WORKER_COUNT :: 14
-DEFAULT_WORK_QUEUE_SIZE :: 256
+DEFAULT_IO_THREAD_COUNT :: 4
+DEFAULT_WORK_QUEUE_SIZE :: 8192
 RECV_BUFFER_SIZE :: 4096
 DEFAULT_PROFILE_PATH :: "profiles/server.spall"
 PROFILE_BUFFER_SIZE :: 64 * 1024
@@ -21,6 +22,7 @@ SPALL_PROFILE :: #config(SPALL_PROFILE, false)
 
 Server_Options :: struct {
 	workers:      int    `usage:"Number of request worker threads."`,
+	io_threads:   int    `args:"name=io-threads" usage:"Number of IO event-loop threads for accepted clients."`,
 	queue_size:   int    `args:"name=queue-size" usage:"Request work queue capacity."`,
 	profile:      bool   `usage:"Write a Spall trace. Requires build with -define:SPALL_PROFILE=true."`,
 	profile_path: string `args:"name=profile-path" usage:"Spall trace output path."`,
@@ -29,6 +31,22 @@ Server_Options :: struct {
 Server_State :: struct {
 	work_sender: chan.Chan(^Work_Item, .Send),
 	next_conn_id: u64,
+	io_threads: []IO_Thread_State,
+	next_io_index: int,
+}
+
+IO_Thread_State :: struct {
+	index: int,
+	loop: ^nbio.Event_Loop,
+	work_sender: chan.Chan(^Work_Item, .Send),
+	ready_sender: chan.Chan(^IO_Thread_State, .Send),
+}
+
+Accepted_Client :: struct {
+	id: u64,
+	socket: net.TCP_Socket,
+	source: net.Endpoint,
+	work_sender: chan.Chan(^Work_Item, .Send),
 }
 
 Connection :: struct {
@@ -42,6 +60,8 @@ Connection :: struct {
 	line_len: int,
 	pending_lines: [dynamic][]byte,
 	busy: bool,
+	waiting_for_queue: bool,
+	retry_queued: bool,
 	closed: bool,
 }
 
@@ -73,18 +93,19 @@ main :: proc() {
 	context.logger = log.create_console_logger()
 	options := Server_Options {
 		workers      = DEFAULT_WORKER_COUNT,
+		io_threads   = DEFAULT_IO_THREAD_COUNT,
 		queue_size   = DEFAULT_WORK_QUEUE_SIZE,
 		profile_path = DEFAULT_PROFILE_PATH,
 	}
 	flags.parse_or_exit(&options, os.args, .Unix)
 
-	if options.workers <= 0 || options.queue_size <= 0 {
-		log.panic("workers and queue-size must be greater than zero")
+	if options.workers <= 0 || options.io_threads <= 0 || options.queue_size <= 0 {
+		log.panic("workers, io-threads, and queue-size must be greater than zero")
 	}
 	if options.profile {
 		when SPALL_PROFILE {
 			profile_start(options.profile_path)
-			_ = profile_thread_start("io event loop")
+			_ = profile_thread_start("accept loop")
 		} else {
 			log.panic("profile requested, but server was built without -define:SPALL_PROFILE=true")
 		}
@@ -104,8 +125,6 @@ main :: proc() {
 		log.panic("server listen failed", listen_err)
 	}
 	defer nbio.close(listener)
-
-	log.info("server listening on", shared.SERVER_ADDRESS, "workers", options.workers, "queue_size", options.queue_size)
 
 	work_queue, queue_err := chan.create_buffered(chan.Chan(^Work_Item), options.queue_size, context.allocator)
 	if queue_err != .None {
@@ -129,12 +148,94 @@ main :: proc() {
 		}
 	}
 
+	ready_queue, ready_err := chan.create_buffered(chan.Chan(^IO_Thread_State), options.io_threads, context.allocator)
+	if ready_err != .None {
+		log.panic("io ready queue create failed:", ready_err)
+	}
+	defer chan.destroy(ready_queue)
+	ready_sender := chan.as_send(ready_queue)
+	ready_receiver := chan.as_recv(ready_queue)
+
+	io_threads := make([]IO_Thread_State, options.io_threads)
+	for i in 0 ..< options.io_threads {
+		io_threads[i] = IO_Thread_State {
+			index = i,
+			work_sender = work_sender,
+			ready_sender = ready_sender,
+		}
+
+		t := thread.create_and_start_with_poly_data(
+			&io_threads[i],
+			io_thread_proc,
+			context,
+			.Normal,
+			true,
+		)
+		if t == nil {
+			log.panic("failed to start io thread:", i)
+		}
+	}
+
+	for i in 0 ..< options.io_threads {
+		io_thread, ok := chan.recv(ready_receiver)
+		if !ok || io_thread == nil || io_thread.loop == nil {
+			log.panic("io thread failed to start:", i)
+		}
+	}
+
+	log.info(
+		"server listening on",
+		shared.SERVER_ADDRESS,
+		"accept_threads",
+		1,
+		"io_threads",
+		options.io_threads,
+		"workers",
+		options.workers,
+		"queue_size",
+		options.queue_size,
+	)
+
 	state := Server_State {
 		work_sender = work_sender,
 		next_conn_id = 1,
+		io_threads = io_threads,
 	}
 	nbio.accept_poly(listener, &state, on_accept)
 
+	for {
+		when SPALL_PROFILE {
+			profile_begin("accept.tick")
+		}
+		err := nbio.tick()
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil {
+			log.panic("event loop tick failed:", err)
+		}
+	}
+}
+
+io_thread_proc :: proc(state: ^IO_Thread_State) {
+	when SPALL_PROFILE {
+		_ = profile_thread_start("io event loop")
+	}
+
+	if err := nbio.acquire_thread_event_loop(); err != nil {
+		log.panic("io event loop init failed:", state.index, err)
+	}
+	defer nbio.release_thread_event_loop()
+
+	state.loop = nbio.current_thread_event_loop()
+	if err := nbio.tick(0); err != nil {
+		log.panic("io event loop startup tick failed:", state.index, err)
+	}
+	if !chan.send(state.ready_sender, state) {
+		log.panic("io thread ready signal failed:", state.index)
+	}
+
+	log.info("io thread started:", state.index)
 	for {
 		when SPALL_PROFILE {
 			profile_begin("io.tick")
@@ -144,7 +245,7 @@ main :: proc() {
 			profile_end()
 		}
 		if err != nil {
-			log.panic("event loop tick failed:", err)
+			log.panic("io event loop tick failed:", state.index, err)
 		}
 	}
 }
@@ -167,13 +268,46 @@ on_accept :: proc(op: ^nbio.Operation, state: ^Server_State) {
 
 	nbio.accept_poly(op.accept.socket, state, on_accept)
 
-	connection := new(Connection)
-	connection.id = state.next_conn_id
+	io_thread := &state.io_threads[state.next_io_index]
+	state.next_io_index = (state.next_io_index + 1) % len(state.io_threads)
+
+	accepted := new(Accepted_Client)
+	accepted.id = state.next_conn_id
 	state.next_conn_id += 1
-	connection.socket = op.accept.client
-	connection.source = op.accept.client_endpoint
+	accepted.socket = op.accept.client
+	accepted.source = op.accept.client_endpoint
+	accepted.work_sender = state.work_sender
+
+	nbio.next_tick_poly(accepted, on_client_assigned, l=io_thread.loop)
+}
+
+on_client_assigned :: proc(op: ^nbio.Operation, accepted: ^Accepted_Client) {
+	when SPALL_PROFILE {
+		profile_begin("io.client_assigned")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
+	if accepted == nil {
+		return
+	}
+	defer free(accepted)
+
+	if err := nbio.associate_socket(accepted.socket, l=op.l); err != nil {
+		log.warn("client socket association failed:", err)
+		net.close(accepted.socket)
+		return
+	}
+
+	connection := new(Connection)
+	connection.id = accepted.id
+	connection.socket = accepted.socket
+	connection.source = accepted.source
 	connection.loop = op.l
-	connection.work_sender = state.work_sender
+	connection.work_sender = accepted.work_sender
 	connection.pending_lines = make([dynamic][]byte)
 
 	log.info("client connected:", connection.source)
@@ -216,7 +350,7 @@ work_worker :: proc(index: int, jobs: chan.Chan(^Work_Item, .Recv)) {
 }
 
 schedule_recv :: proc(connection: ^Connection) {
-	if connection.closed || connection.busy {
+	if connection.closed || connection.busy || connection.waiting_for_queue {
 		return
 	}
 	nbio.recv_poly(connection.socket, {connection.recv_buf[:]}, connection, on_recv, l=connection.loop)
@@ -294,17 +428,42 @@ dispatch_next_line :: proc(connection: ^Connection) {
 		return
 	}
 
-	line := pop_front(&connection.pending_lines)
+	line := connection.pending_lines[0]
 	work := new(Work_Item)
 	work.connection = connection
 	work.line = line
-	connection.busy = true
 
 	if !chan.try_send(connection.work_sender, work) {
-		delete(work.line)
 		free(work)
-		connection.busy = false
-		close_connection(connection)
+		connection.waiting_for_queue = true
+		schedule_dispatch_retry(connection)
+		return
+	}
+
+	_ = pop_front(&connection.pending_lines)
+	connection.busy = true
+	connection.waiting_for_queue = false
+}
+
+schedule_dispatch_retry :: proc(connection: ^Connection) {
+	if connection.closed || connection.retry_queued {
+		return
+	}
+
+	connection.retry_queued = true
+	nbio.next_tick_poly(connection, on_dispatch_retry, l=connection.loop)
+}
+
+on_dispatch_retry :: proc(op: ^nbio.Operation, connection: ^Connection) {
+	if connection.closed {
+		return
+	}
+
+	connection.retry_queued = false
+	connection.waiting_for_queue = false
+	dispatch_next_line(connection)
+	if !connection.closed && !connection.busy && !connection.waiting_for_queue {
+		schedule_recv(connection)
 	}
 }
 
