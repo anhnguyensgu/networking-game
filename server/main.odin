@@ -39,6 +39,10 @@ main :: proc() {
 handle_client :: proc(client: net.TCP_Socket, source: net.Endpoint) {
 	log.info("client connected:", source)
 	line_buf: [shared.MAX_LINE_BYTES]byte
+	defer {
+		net.close(client)
+		log.info("client disconnected")
+	}
 
 	for {
 		line, ok := shared.read_json_line(client, line_buf[:])
@@ -90,6 +94,4 @@ handle_client :: proc(client: net.TCP_Socket, source: net.Endpoint) {
 		}
 	}
 
-	net.close(client)
-	log.info("client disconnected")
 }
