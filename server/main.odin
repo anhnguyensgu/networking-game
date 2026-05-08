@@ -9,7 +9,6 @@ import "core:os"
 import "core:prof/spall"
 import "core:sync"
 import "core:sync/chan"
-import "core:sys/posix"
 import "core:thread"
 import "core:time"
 
@@ -74,10 +73,7 @@ IO_Thread_State :: struct {
 	accepted_receiver: chan.Chan(^Accepted_Client, .Recv),
 	response_sender: chan.Chan(^Response_Item, .Send),
 	response_receiver: chan.Chan(^Response_Item, .Recv),
-	wake_read_socket: net.TCP_Socket,
-	wake_write_socket: net.TCP_Socket,
-	wake_pending: bool,
-	wake_buf: [64]byte,
+	task_drain_pending: bool,
 	metrics_enabled: bool,
 	metrics_interval: time.Duration,
 	metrics_last_tick: time.Tick,
@@ -89,13 +85,18 @@ IO_Metrics :: struct {
 	total_ticks: int,
 	empty_ticks: int,
 	quiesce_rounds: int,
-	wake_events: int,
-	accepted_drained: int,
-	responses_drained: int,
+	accepted_tasks: int,
+	response_tasks: int,
 	requests_dispatched: int,
 	recv_events: int,
 	send_events: int,
 	responses_sent: int,
+}
+
+IO_Tick_Result :: struct {
+	progress: bool,
+	queue_progress: bool,
+	event_progress: bool,
 }
 
 Accepted_Client :: struct {
@@ -154,34 +155,6 @@ io_tick_timeout_from_us :: proc(timeout_us: int) -> time.Duration {
 	return time.Duration(timeout_us) * time.Microsecond
 }
 
-create_io_wake_pair :: proc() -> (read_socket, write_socket: net.TCP_Socket, ok: bool) {
-	fds: [2]posix.FD
-	if posix.socketpair(.UNIX, .STREAM, .IP, &fds) != .OK {
-		return
-	}
-
-	read_socket = net.TCP_Socket(fds[0])
-	write_socket = net.TCP_Socket(fds[1])
-
-	if err := net.set_blocking(read_socket, false); err != nil {
-		net.close(read_socket)
-		net.close(write_socket)
-		read_socket = {}
-		write_socket = {}
-		return
-	}
-	if err := net.set_blocking(write_socket, false); err != nil {
-		net.close(read_socket)
-		net.close(write_socket)
-		read_socket = {}
-		write_socket = {}
-		return
-	}
-
-	ok = true
-	return
-}
-
 main :: proc() {
 	context.logger = log.create_console_logger()
 	options := Server_Options {
@@ -235,8 +208,6 @@ main :: proc() {
 	work_channels := make([]chan.Chan(^Work_Item), options.io_threads)
 	accepted_channels := make([]chan.Chan(^Accepted_Client), options.io_threads)
 	response_channels := make([]chan.Chan(^Response_Item), options.io_threads)
-	wake_read_sockets := make([]net.TCP_Socket, options.io_threads)
-	wake_write_sockets := make([]net.TCP_Socket, options.io_threads)
 	work_queues := make([]Work_Queue_State, options.io_threads)
 	for i in 0 ..< options.io_threads {
 		work_queue, queue_err := chan.create_buffered(chan.Chan(^Work_Item), options.queue_size, context.allocator)
@@ -264,13 +235,6 @@ main :: proc() {
 		}
 
 		response_channels[i] = response_queue
-
-		wake_read_socket, wake_write_socket, wake_ok := create_io_wake_pair()
-		if !wake_ok {
-			log.panic("io wake pair create failed:", i)
-		}
-		wake_read_sockets[i] = wake_read_socket
-		wake_write_sockets[i] = wake_write_socket
 	}
 	defer {
 		for work_queue in work_channels {
@@ -282,17 +246,9 @@ main :: proc() {
 		for response_queue in response_channels {
 			chan.destroy(response_queue)
 		}
-		for wake_socket in wake_read_sockets {
-			net.close(wake_socket)
-		}
-		for wake_socket in wake_write_sockets {
-			net.close(wake_socket)
-		}
 		delete(work_channels)
 		delete(accepted_channels)
 		delete(response_channels)
-		delete(wake_read_sockets)
-		delete(wake_write_sockets)
 		delete(work_queues)
 	}
 
@@ -342,8 +298,6 @@ main :: proc() {
 			accepted_receiver = chan.as_recv(accepted_channels[i]),
 			response_sender = chan.as_send(response_channels[i]),
 			response_receiver = chan.as_recv(response_channels[i]),
-			wake_read_socket = wake_read_sockets[i],
-			wake_write_socket = wake_write_sockets[i],
 			metrics_enabled = options.metrics,
 			metrics_interval = metrics_interval,
 			ready_sender = ready_sender,
@@ -422,10 +376,6 @@ io_thread_proc :: proc(state: ^IO_Thread_State) {
 	defer nbio.release_thread_event_loop()
 
 	state.loop = nbio.current_thread_event_loop()
-	if err := nbio.associate_socket(state.wake_read_socket, l=state.loop); err != nil {
-		log.panic("io wake socket association failed:", state.index, err)
-	}
-	schedule_wake_recv(state)
 	if err := nbio.tick(0); err != nil {
 		log.panic("io event loop startup tick failed:", state.index, err)
 	}
@@ -436,15 +386,20 @@ io_thread_proc :: proc(state: ^IO_Thread_State) {
 	log.info("io thread started:", state.index)
 	state.metrics_last_tick = time.tick_now()
 	for {
-		tick_io_thread(state, state.tick_timeout)
-		drain_io_to_quiescence(state)
+		result := tick_io_thread(state, state.tick_timeout, prepare_to_wait=true)
+		drain_io_to_quiescence(state, result)
 		maybe_log_io_metrics(state)
 	}
 }
 
-tick_io_thread :: proc(io_thread: ^IO_Thread_State, timeout: time.Duration) -> bool {
-	before_progress := io_metrics_progress(io_thread)
+tick_io_thread :: proc(io_thread: ^IO_Thread_State, timeout: time.Duration, prepare_to_wait := false) -> IO_Tick_Result {
+	before_queue_progress := io_queue_progress(io_thread)
+	before_event_progress := io_event_progress(io_thread)
 	drain_io_thread_queues(io_thread)
+	if prepare_to_wait {
+		sync.atomic_store(&io_thread.task_drain_pending, false)
+		drain_io_thread_queues(io_thread)
+	}
 	when SPALL_PROFILE {
 		profile_begin("io.tick")
 	}
@@ -456,21 +411,35 @@ tick_io_thread :: proc(io_thread: ^IO_Thread_State, timeout: time.Duration) -> b
 		log.panic("io event loop tick failed:", io_thread.index, err)
 	}
 	drain_io_thread_queues(io_thread)
-	after_progress := io_metrics_progress(io_thread)
-	io_thread.metrics.total_ticks += 1
-	if after_progress == before_progress {
-		io_thread.metrics.empty_ticks += 1
-		return false
+	after_queue_progress := io_queue_progress(io_thread)
+	after_event_progress := io_event_progress(io_thread)
+
+	result := IO_Tick_Result {
+		queue_progress = after_queue_progress != before_queue_progress,
+		event_progress = after_event_progress != before_event_progress,
 	}
-	return true
+	result.progress = result.queue_progress || result.event_progress
+	io_thread.metrics.total_ticks += 1
+	if !result.progress {
+		io_thread.metrics.empty_ticks += 1
+	}
+	return result
 }
 
-drain_io_to_quiescence :: proc(io_thread: ^IO_Thread_State) {
+drain_io_to_quiescence :: proc(io_thread: ^IO_Thread_State, previous: IO_Tick_Result) {
+	if !previous.progress {
+		return
+	}
+
 	for _ in 0 ..< io_thread.quiesce_rounds {
-		if !tick_io_thread(io_thread, 0) {
+		result := tick_io_thread(io_thread, 0)
+		if !result.progress {
 			return
 		}
 		io_thread.metrics.quiesce_rounds += 1
+		if result.queue_progress && !result.event_progress {
+			return
+		}
 	}
 }
 
@@ -503,61 +472,32 @@ on_accept :: proc(op: ^nbio.Operation, state: ^Server_State) {
 	accepted.work_sender = io_thread.work_sender
 	accepted.io_thread = io_thread
 
+	if io_thread.loop == nil {
+		net.close(accepted.socket)
+		free(accepted)
+		return
+	}
 	if !chan.try_send(io_thread.accepted_sender, accepted) {
 		net.close(accepted.socket)
 		free(accepted)
 		return
 	}
-	signal_io_thread(io_thread)
+	schedule_io_thread_task_drain(io_thread)
+}
+
+schedule_io_thread_task_drain :: proc(io_thread: ^IO_Thread_State) {
+	if io_thread == nil || io_thread.loop == nil {
+		return
+	}
+	if sync.atomic_exchange(&io_thread.task_drain_pending, true) {
+		return
+	}
+	nbio.wake_up(io_thread.loop)
 }
 
 drain_io_thread_queues :: proc(io_thread: ^IO_Thread_State) {
 	drain_accepted_clients(io_thread)
 	drain_responses(io_thread)
-}
-
-schedule_wake_recv :: proc(io_thread: ^IO_Thread_State) {
-	nbio.recv_poly(io_thread.wake_read_socket, {io_thread.wake_buf[:]}, io_thread, on_io_wake, l=io_thread.loop)
-}
-
-on_io_wake :: proc(op: ^nbio.Operation, io_thread: ^IO_Thread_State) {
-	when SPALL_PROFILE {
-		profile_begin("io.wake")
-	}
-	defer {
-		when SPALL_PROFILE {
-			profile_end()
-		}
-	}
-
-	if io_thread == nil {
-		return
-	}
-	if op.recv.err != nil || op.recv.received == 0 {
-		log.warn("io wake recv failed:", io_thread.index, op.recv.err)
-		return
-	}
-
-	io_thread.metrics.wake_events += 1
-	sync.atomic_store(&io_thread.wake_pending, false)
-	drain_io_thread_queues(io_thread)
-	schedule_wake_recv(io_thread)
-}
-
-signal_io_thread :: proc(io_thread: ^IO_Thread_State) {
-	if io_thread == nil {
-		return
-	}
-
-	if sync.atomic_exchange(&io_thread.wake_pending, true) {
-		return
-	}
-
-	wake_byte := [?]byte{1}
-	_, err := net.send_tcp(io_thread.wake_write_socket, wake_byte[:])
-	if err != nil {
-		sync.atomic_store(&io_thread.wake_pending, false)
-	}
 }
 
 drain_accepted_clients :: proc(io_thread: ^IO_Thread_State) {
@@ -567,7 +507,7 @@ drain_accepted_clients :: proc(io_thread: ^IO_Thread_State) {
 			return
 		}
 
-		io_thread.metrics.accepted_drained += 1
+		io_thread.metrics.accepted_tasks += 1
 		assign_client_to_io_thread(io_thread, accepted)
 	}
 }
@@ -690,12 +630,17 @@ enqueue_response :: proc(response: ^Response_Item) {
 	}
 
 	io_thread := connection.io_thread
+	if io_thread.loop == nil {
+		delete(response.data)
+		free(response)
+		return
+	}
 	if !chan.send(io_thread.response_sender, response) {
 		delete(response.data)
 		free(response)
 		return
 	}
-	signal_io_thread(io_thread)
+	schedule_io_thread_task_drain(io_thread)
 }
 
 drain_responses :: proc(io_thread: ^IO_Thread_State) {
@@ -705,17 +650,20 @@ drain_responses :: proc(io_thread: ^IO_Thread_State) {
 			return
 		}
 
-		io_thread.metrics.responses_drained += 1
+		io_thread.metrics.response_tasks += 1
 		on_response_ready(response)
 	}
 }
 
-io_metrics_progress :: proc(io_thread: ^IO_Thread_State) -> int {
+io_queue_progress :: proc(io_thread: ^IO_Thread_State) -> int {
 	m := &io_thread.metrics
-	return m.wake_events +
-	       m.accepted_drained +
-	       m.responses_drained +
-	       m.requests_dispatched +
+	return m.accepted_tasks +
+	       m.response_tasks
+}
+
+io_event_progress :: proc(io_thread: ^IO_Thread_State) -> int {
+	m := &io_thread.metrics
+	return m.requests_dispatched +
 	       m.recv_events +
 	       m.send_events +
 	       m.responses_sent
@@ -758,12 +706,10 @@ maybe_log_io_metrics :: proc(io_thread: ^IO_Thread_State) {
 		requests_per_tick,
 		"responses_per_tick",
 		responses_per_tick,
-		"wake_events",
-		m.wake_events,
-		"accepted_drained",
-		m.accepted_drained,
-		"responses_drained",
-		m.responses_drained,
+		"accepted_tasks",
+		m.accepted_tasks,
+		"response_tasks",
+		m.response_tasks,
 		"requests_dispatched",
 		m.requests_dispatched,
 		"recv_events",
