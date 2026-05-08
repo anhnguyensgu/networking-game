@@ -21,10 +21,14 @@ WORKER_IDLE_SLEEP :: 50 * time.Microsecond
 DEFAULT_IO_TICK_TIMEOUT_US :: -1
 DEFAULT_IO_QUIESCE_ROUNDS :: 8
 DEFAULT_METRICS_INTERVAL_MS :: 1000
+DEFAULT_CPU_WORK_US :: 0
 DEFAULT_PROFILE_PATH :: "profiles/server.spall"
 PROFILE_BUFFER_SIZE :: 64 * 1024
 PROFILE_FLUSH_EVENTS :: 512
+CPU_WORK_BATCH_SIZE :: 256
 SPALL_PROFILE :: #config(SPALL_PROFILE, false)
+
+cpu_work_sink: u64
 
 Server_Options :: struct {
 	workers:      int    `usage:"Number of request worker threads."`,
@@ -32,6 +36,7 @@ Server_Options :: struct {
 	queue_size:   int    `args:"name=queue-size" usage:"Request work queue capacity per IO shard."`,
 	io_tick_timeout_us: int `args:"name=io-tick-timeout-us" usage:"IO loop tick timeout in microseconds. -1 blocks until socket or explicit wake."`,
 	io_quiesce_rounds: int `args:"name=io-quiesce-rounds" usage:"Maximum non-blocking IO drain rounds after each blocking tick. Zero disables quiescing."`,
+	cpu_work_us:  int    `args:"name=cpu-work-us" usage:"Approximate CPU work to burn per valid request in microseconds. Zero disables."`,
 	steal_work:   bool   `args:"name=steal-work" usage:"Allow idle workers to scan other IO queues for work."`,
 	metrics:      bool   `usage:"Log per-IO useful/empty tick metrics."`,
 	metrics_ms:   int    `args:"name=metrics-ms" usage:"Per-IO metrics log interval in milliseconds."`,
@@ -55,6 +60,7 @@ Worker_State :: struct {
 	index: int,
 	home_queue: int,
 	work_queues: []Work_Queue_State,
+	cpu_work: time.Duration,
 	steal_work: bool,
 }
 
@@ -184,6 +190,7 @@ main :: proc() {
 		queue_size         = DEFAULT_WORK_QUEUE_SIZE,
 		io_tick_timeout_us = DEFAULT_IO_TICK_TIMEOUT_US,
 		io_quiesce_rounds  = DEFAULT_IO_QUIESCE_ROUNDS,
+		cpu_work_us        = DEFAULT_CPU_WORK_US,
 		metrics_ms         = DEFAULT_METRICS_INTERVAL_MS,
 		profile_path       = DEFAULT_PROFILE_PATH,
 	}
@@ -197,6 +204,9 @@ main :: proc() {
 	}
 	if options.io_quiesce_rounds < 0 {
 		log.panic("io-quiesce-rounds must be zero or greater")
+	}
+	if options.cpu_work_us < 0 {
+		log.panic("cpu-work-us must be zero or greater")
 	}
 	if options.profile {
 		when SPALL_PROFILE {
@@ -289,11 +299,13 @@ main :: proc() {
 	worker_states := make([]Worker_State, options.workers)
 	defer delete(worker_states)
 
+	cpu_work := time.Duration(options.cpu_work_us) * time.Microsecond
 	for i in 0 ..< options.workers {
 		worker_states[i] = Worker_State {
 			index = i,
 			home_queue = i % len(work_queues),
 			work_queues = work_queues,
+			cpu_work = cpu_work,
 			steal_work = options.steal_work,
 		}
 
@@ -373,6 +385,8 @@ main :: proc() {
 		options.io_tick_timeout_us,
 		"io_quiesce_rounds",
 		options.io_quiesce_rounds,
+		"cpu_work_us",
+		options.cpu_work_us,
 		"steal_work",
 		options.steal_work,
 	)
@@ -615,7 +629,7 @@ work_worker :: proc(worker: ^Worker_State) {
 		}
 		response := new(Response_Item)
 		response.connection = work.connection
-		response.data = process_request(work.line)
+		response.data = process_request(work.line, worker.cpu_work)
 
 		delete(work.line)
 		free(work)
@@ -882,7 +896,7 @@ on_dispatch_retry :: proc(op: ^nbio.Operation, connection: ^Connection) {
 	}
 }
 
-process_request :: proc(line: []byte) -> []byte {
+process_request :: proc(line: []byte, cpu_work: time.Duration) -> []byte {
 	when SPALL_PROFILE {
 		profile_begin("request.process")
 	}
@@ -916,6 +930,7 @@ process_request :: proc(line: []byte) -> []byte {
 		if err != nil {
 			return encode_json_line(shared.make_error_response(envelope.seq, "invalid world map request"))
 		}
+		simulate_cpu_work(cpu_work)
 		return encode_json_line(shared.make_world_map_response(request.seq, ENEMY_BASES))
 
 	case .Select_Base:
@@ -930,11 +945,46 @@ process_request :: proc(line: []byte) -> []byte {
 		if err != nil {
 			return encode_json_line(shared.make_error_response(envelope.seq, "invalid select base request"))
 		}
+		simulate_cpu_work(cpu_work)
 		return encode_json_line(shared.make_error_response(request.seq, "battle screen is not implemented yet"))
 
 	case:
 		return encode_json_line(shared.make_error_response(envelope.seq, "unknown message kind"))
 	}
+}
+
+simulate_cpu_work :: proc(duration: time.Duration) {
+	if duration <= 0 {
+		return
+	}
+
+	when SPALL_PROFILE {
+		profile_begin("request.cpu_work")
+	}
+	defer {
+		when SPALL_PROFILE {
+			profile_end()
+		}
+	}
+
+	started := time.tick_now()
+	state := sync.atomic_load_explicit(&cpu_work_sink, .Relaxed)
+	if state == 0 {
+		state = 0x9e3779b97f4a7c15
+	}
+
+	for {
+		for _ in 0 ..< CPU_WORK_BATCH_SIZE {
+			state = state ~ (state << 13)
+			state = state ~ (state >> 7)
+			state = state ~ (state << 17)
+		}
+		if time.tick_since(started) >= duration {
+			break
+		}
+	}
+
+	sync.atomic_store_explicit(&cpu_work_sink, state, .Relaxed)
 }
 
 encode_json_line :: proc(message: any) -> []byte {
