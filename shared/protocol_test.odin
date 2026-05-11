@@ -41,3 +41,24 @@ envelope_decodes_message_kind :: proc(t: ^testing.T) {
 	testing.expect_value(t, envelope.kind, Message_Kind.Get_World_Map)
 	testing.expect_value(t, envelope.seq, u64(9))
 }
+
+@(test)
+move_to_request_round_trips_json :: proc(t: ^testing.T) {
+	request := make_move_to_request(11, 3, 120, 240)
+	data, err := encode_json(request)
+	if !testing.expectf(t, err == nil, "encode_json failed: %v", err) {
+		return
+	}
+	defer delete(data)
+
+	decoded: Move_To_Request
+	if err := decode_json(data, &decoded); !testing.expectf(t, err == nil, "decode_json failed: %v", err) {
+		return
+	}
+
+	testing.expect_value(t, decoded.kind, Message_Kind.Move_To)
+	testing.expect_value(t, decoded.seq, u64(11))
+	testing.expect_value(t, decoded.client_seq, u32(3))
+	testing.expect_value(t, decoded.x, f32(120))
+	testing.expect_value(t, decoded.y, f32(240))
+}

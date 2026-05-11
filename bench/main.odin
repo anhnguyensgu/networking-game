@@ -341,23 +341,34 @@ send_request :: proc(socket: net.TCP_Socket, seq: u64) -> bool {
 
 read_world_map_response :: proc(socket: net.TCP_Socket, reader: ^Buffered_Line_Reader, seq: u64) -> bool {
 	line_buf: [shared.MAX_LINE_BYTES]byte
-	line, read_ok := read_json_line_buffered(socket, reader, line_buf[:])
-	if !read_ok {
-		return false
-	}
+	for {
+		line, read_ok := read_json_line_buffered(socket, reader, line_buf[:])
+		if !read_ok {
+			return false
+		}
 
-	envelope, envelope_err := shared.decode_envelope(line)
-	if envelope_err != nil || envelope.kind != .World_Map || envelope.seq != seq {
-		return false
-	}
+		envelope, envelope_err := shared.decode_envelope(line)
+		if envelope_err != nil {
+			return false
+		}
 
-	response: shared.World_Map_Response
-	if err := shared.decode_json(line, &response); err != nil {
-		return false
-	}
-	shared.destroy_world_map_response(&response)
+		if envelope.kind == .World_Map {
+			if envelope.seq == seq {
+				response: shared.World_Map_Response
+				if err := shared.decode_json(line, &response); err != nil {
+					return false
+				}
+				shared.destroy_world_map_response(&response)
+				return true
+			}
+		}
 
-	return true
+		if envelope.kind == .Error && envelope.seq == seq {
+			return false
+		}
+
+		// Continue reading to skip other messages (e.g., broadcasts)
+	}
 }
 
 record_latency :: proc(result: ^Worker_Result, latency: time.Duration) {

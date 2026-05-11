@@ -5,7 +5,7 @@ import "core:net"
 
 SERVER_PORT :: 43120
 SERVER_ADDRESS :: "127.0.0.1:43120"
-MAX_LINE_BYTES :: 16 * 1024
+MAX_LINE_BYTES :: 128 * 1024
 
 JSON_OPTIONS :: json.Marshal_Options {
 	spec = .JSON,
@@ -17,7 +17,26 @@ Message_Kind :: enum {
 	Get_World_Map,
 	World_Map,
 	Select_Base,
+	Move_To,
+	Aim,
+	Shoot,
+	Use_Item,
+	Buy,
+	World_Snapshot,
 	Error,
+}
+
+Player_ID :: u64
+
+Command_Kind :: enum {
+	Unknown,
+	System_Connected,
+	System_Disconnected,
+	Move_To,
+	Aim,
+	Shoot,
+	Use_Item,
+	Buy,
 }
 
 Envelope :: struct {
@@ -36,6 +55,42 @@ Select_Base_Request :: struct {
 	base_id: int          `json:"base_id"`,
 }
 
+Move_To_Request :: struct {
+	kind:       Message_Kind `json:"kind"`,
+	seq:        u64          `json:"seq"`,
+	client_seq: u32          `json:"client_seq"`,
+	x:          f32          `json:"x"`,
+	y:          f32          `json:"y"`,
+}
+
+Aim_Request :: struct {
+	kind:       Message_Kind `json:"kind"`,
+	seq:        u64          `json:"seq"`,
+	client_seq: u32          `json:"client_seq"`,
+	angle:      f32          `json:"angle"`,
+}
+
+Shoot_Request :: struct {
+	kind:             Message_Kind `json:"kind"`,
+	seq:              u64          `json:"seq"`,
+	client_seq:       u32          `json:"client_seq"`,
+	target_player_id: Player_ID    `json:"target_player_id"`,
+}
+
+Use_Item_Request :: struct {
+	kind:       Message_Kind `json:"kind"`,
+	seq:        u64          `json:"seq"`,
+	client_seq: u32          `json:"client_seq"`,
+	item_id:    int          `json:"item_id"`,
+}
+
+Buy_Request :: struct {
+	kind:       Message_Kind `json:"kind"`,
+	seq:        u64          `json:"seq"`,
+	client_seq: u32          `json:"client_seq"`,
+	product_id: int          `json:"product_id"`,
+}
+
 Enemy_Base_View :: struct {
 	id:    int    `json:"id"`,
 	x:     f32    `json:"x"`,
@@ -50,6 +105,21 @@ World_Map_Response :: struct {
 	bases: []Enemy_Base_View `json:"bases"`,
 }
 
+Player_Snapshot :: struct {
+	player_id:     Player_ID `json:"player_id"`,
+	connection_id: u64       `json:"connection_id"`,
+	x:             f32       `json:"x"`,
+	y:             f32       `json:"y"`,
+	aim_angle:     f32       `json:"aim_angle"`,
+}
+
+World_Snapshot_Response :: struct {
+	kind:        Message_Kind      `json:"kind"`,
+	seq:         u64               `json:"seq"`,
+	server_tick: u64               `json:"server_tick"`,
+	players:     []Player_Snapshot `json:"players"`,
+}
+
 Error_Response :: struct {
 	kind:    Message_Kind `json:"kind"`,
 	seq:     u64          `json:"seq"`,
@@ -60,8 +130,32 @@ make_get_world_map_request :: proc(seq: u64) -> Get_World_Map_Request {
 	return {kind = .Get_World_Map, seq = seq}
 }
 
+make_move_to_request :: proc(seq: u64, client_seq: u32, x, y: f32) -> Move_To_Request {
+	return {kind = .Move_To, seq = seq, client_seq = client_seq, x = x, y = y}
+}
+
+make_aim_request :: proc(seq: u64, client_seq: u32, angle: f32) -> Aim_Request {
+	return {kind = .Aim, seq = seq, client_seq = client_seq, angle = angle}
+}
+
+make_shoot_request :: proc(seq: u64, client_seq: u32, target_player_id: Player_ID) -> Shoot_Request {
+	return {kind = .Shoot, seq = seq, client_seq = client_seq, target_player_id = target_player_id}
+}
+
+make_use_item_request :: proc(seq: u64, client_seq: u32, item_id: int) -> Use_Item_Request {
+	return {kind = .Use_Item, seq = seq, client_seq = client_seq, item_id = item_id}
+}
+
+make_buy_request :: proc(seq: u64, client_seq: u32, product_id: int) -> Buy_Request {
+	return {kind = .Buy, seq = seq, client_seq = client_seq, product_id = product_id}
+}
+
 make_world_map_response :: proc(seq: u64, bases: []Enemy_Base_View) -> World_Map_Response {
 	return {kind = .World_Map, seq = seq, bases = bases}
+}
+
+make_world_snapshot_response :: proc(seq, server_tick: u64, players: []Player_Snapshot) -> World_Snapshot_Response {
+	return {kind = .World_Snapshot, seq = seq, server_tick = server_tick, players = players}
 }
 
 make_error_response :: proc(seq: u64, message: string) -> Error_Response {

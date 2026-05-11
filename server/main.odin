@@ -1,12 +1,15 @@
 package main
 
 import shared "../shared"
+import json "core:encoding/json"
 import "core:flags"
 import "core:log"
+import "core:math"
 import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:prof/spall"
+import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
@@ -15,6 +18,8 @@ import "core:time"
 DEFAULT_WORKER_COUNT :: 14
 DEFAULT_IO_THREAD_COUNT :: 1
 DEFAULT_WORK_QUEUE_SIZE :: 8192
+DEFAULT_GAME_COMMAND_QUEUE_SIZE :: 8192
+DEFAULT_BROADCAST_QUEUE_SIZE :: 1024
 RECV_BUFFER_SIZE :: 4096
 WORKER_IDLE_SLEEP :: 50 * time.Microsecond
 DEFAULT_IO_TICK_TIMEOUT_US :: -1
@@ -25,9 +30,23 @@ DEFAULT_PROFILE_PATH :: "profiles/server.spall"
 PROFILE_BUFFER_SIZE :: 64 * 1024
 PROFILE_FLUSH_EVENTS :: 512
 CPU_WORK_BATCH_SIZE :: 256
+INPUT_DELAY_TICKS :: u64(2)
+MAX_STALE_TICKS :: u64(20)
+MAX_TOTAL_COMMANDS_PER_TICK :: 1000
+MAX_FUTURE_COMMANDS :: 8192
+MAX_FUTURE_COMMANDS_PER_CONNECTION :: 8
+BROADCAST_INTERVAL_TICKS :: u64(3)
 SPALL_PROFILE :: #config(SPALL_PROFILE, false)
 
+NPC_COUNT :: 100000
+
+NPC :: struct {
+	x, y: f32,
+}
+
 cpu_work_sink: u64
+current_server_tick: u64
+game_command_sender: chan.Chan(^Game_Command, .Send)
 
 Server_Options :: struct {
 	workers:      int    `usage:"Number of request worker threads."`,
@@ -73,6 +92,9 @@ IO_Thread_State :: struct {
 	accepted_receiver: chan.Chan(^Accepted_Client, .Recv),
 	response_sender: chan.Chan(^Response_Item, .Send),
 	response_receiver: chan.Chan(^Response_Item, .Recv),
+	broadcast_sender: chan.Chan(^Broadcast_Shard_Message, .Send),
+	broadcast_receiver: chan.Chan(^Broadcast_Shard_Message, .Recv),
+	connections: [dynamic]^Connection,
 	task_drain_pending: bool,
 	metrics_enabled: bool,
 	metrics_interval: time.Duration,
@@ -87,6 +109,8 @@ IO_Metrics :: struct {
 	quiesce_rounds: int,
 	accepted_tasks: int,
 	response_tasks: int,
+	broadcast_tasks: int,
+	broadcast_sends: int,
 	requests_dispatched: int,
 	recv_events: int,
 	send_events: int,
@@ -121,17 +145,186 @@ Connection :: struct {
 	busy: bool,
 	waiting_for_queue: bool,
 	retry_queued: bool,
+	receives_snapshots: bool,
 	closed: bool,
 }
 
 Work_Item :: struct {
 	connection: ^Connection,
 	line: []byte,
+	is_pooled: bool,
 }
 
 Response_Item :: struct {
 	connection: ^Connection,
 	data: []byte,
+	release_only: bool,
+	is_pooled: bool,
+}
+
+Request_Result :: struct {
+	data: []byte,
+	release_only: bool,
+}
+
+Broadcast_Shard_Message :: struct {
+	data: []byte,
+	remaining_sends: int,
+}
+
+Game_Command :: struct {
+	connection_id: u64,
+	client_seq: u32,
+	recv_tick: u64,
+	target_tick: u64,
+	kind: shared.Command_Kind,
+	x: f32,
+	y: f32,
+	aim_angle: f32,
+	target_player_id: shared.Player_ID,
+	item_id: int,
+	product_id: int,
+	is_pooled: bool,
+}
+
+Work_Item_Pool: struct {
+	items: [dynamic]^Work_Item,
+	mutex: sync.Mutex,
+}
+
+Response_Item_Pool: struct {
+	items: [dynamic]^Response_Item,
+	mutex: sync.Mutex,
+}
+
+Game_Command_Pool: struct {
+	items: [dynamic]^Game_Command,
+	mutex: sync.Mutex,
+}
+
+Line_Buffer_Pool: struct {
+	items: [dynamic][]byte,
+	mutex: sync.Mutex,
+}
+
+alloc_work_item :: proc() -> ^Work_Item {
+	sync.mutex_lock(&Work_Item_Pool.mutex)
+	defer sync.mutex_unlock(&Work_Item_Pool.mutex)
+	if len(Work_Item_Pool.items) > 0 {
+		item := pop(&Work_Item_Pool.items)
+		item^ = {}
+		item.is_pooled = true
+		return item
+	}
+	item := new(Work_Item)
+	item.is_pooled = true
+	return item
+}
+
+free_work_item :: proc(item: ^Work_Item) {
+	if item == nil do return
+	if !item.is_pooled {
+		free(item)
+		return
+	}
+	sync.mutex_lock(&Work_Item_Pool.mutex)
+	defer sync.mutex_unlock(&Work_Item_Pool.mutex)
+	append(&Work_Item_Pool.items, item)
+}
+
+alloc_response_item :: proc() -> ^Response_Item {
+	sync.mutex_lock(&Response_Item_Pool.mutex)
+	defer sync.mutex_unlock(&Response_Item_Pool.mutex)
+	if len(Response_Item_Pool.items) > 0 {
+		item := pop(&Response_Item_Pool.items)
+		item^ = {}
+		item.is_pooled = true
+		return item
+	}
+	item := new(Response_Item)
+	item.is_pooled = true
+	return item
+}
+
+free_response_item :: proc(item: ^Response_Item) {
+	if item == nil do return
+	if !item.is_pooled {
+		free(item)
+		return
+	}
+	sync.mutex_lock(&Response_Item_Pool.mutex)
+	defer sync.mutex_unlock(&Response_Item_Pool.mutex)
+	append(&Response_Item_Pool.items, item)
+}
+
+alloc_game_command :: proc() -> ^Game_Command {
+	sync.mutex_lock(&Game_Command_Pool.mutex)
+	defer sync.mutex_unlock(&Game_Command_Pool.mutex)
+	if len(Game_Command_Pool.items) > 0 {
+		item := pop(&Game_Command_Pool.items)
+		item^ = {}
+		item.is_pooled = true
+		return item
+	}
+	item := new(Game_Command)
+	item.is_pooled = true
+	return item
+}
+
+free_game_command :: proc(item: ^Game_Command) {
+	if item == nil do return
+	if !item.is_pooled {
+		free(item)
+		return
+	}
+	sync.mutex_lock(&Game_Command_Pool.mutex)
+	defer sync.mutex_unlock(&Game_Command_Pool.mutex)
+	append(&Game_Command_Pool.items, item)
+}
+
+alloc_line_buffer :: proc(size: int) -> []byte {
+	sync.mutex_lock(&Line_Buffer_Pool.mutex)
+	if len(Line_Buffer_Pool.items) > 0 {
+		buf := pop(&Line_Buffer_Pool.items)
+		sync.mutex_unlock(&Line_Buffer_Pool.mutex)
+		return buf[:size]
+	}
+	sync.mutex_unlock(&Line_Buffer_Pool.mutex)
+	buf := make([]byte, shared.MAX_LINE_BYTES)
+	return buf[:size]
+}
+
+free_line_buffer :: proc(line: []byte) {
+	if line == nil || raw_data(line) == nil do return
+	// Recover the full MAX_LINE_BYTES backing regardless of the sub-slice length.
+	full := ([^]byte)(raw_data(line))[:shared.MAX_LINE_BYTES]
+	sync.mutex_lock(&Line_Buffer_Pool.mutex)
+	defer sync.mutex_unlock(&Line_Buffer_Pool.mutex)
+	append(&Line_Buffer_Pool.items, full)
+}
+
+Player :: struct {
+	id: shared.Player_ID,
+	connection_id: u64,
+	x: f32,
+	y: f32,
+	aim_angle: f32,
+	last_client_seq: u32,
+	subscribed: bool,
+}
+
+World :: struct {
+	next_player_id: shared.Player_ID,
+	players: [dynamic]Player,
+	npcs: []NPC,
+}
+
+Simulation_State :: struct {
+	world: World,
+	future_commands: [dynamic]Game_Command,
+	ready_commands: [dynamic]Game_Command,
+	gameplay_commands: [dynamic]Game_Command,
+	keep_commands: [dynamic]bool,
 }
 
 when SPALL_PROFILE {
@@ -208,7 +401,17 @@ main :: proc() {
 	work_channels := make([]chan.Chan(^Work_Item), options.io_threads)
 	accepted_channels := make([]chan.Chan(^Accepted_Client), options.io_threads)
 	response_channels := make([]chan.Chan(^Response_Item), options.io_threads)
+	broadcast_channels := make([]chan.Chan(^Broadcast_Shard_Message), options.io_threads)
 	work_queues := make([]Work_Queue_State, options.io_threads)
+	game_command_queue, command_queue_err := chan.create_buffered(chan.Chan(^Game_Command), DEFAULT_GAME_COMMAND_QUEUE_SIZE, context.allocator)
+	if command_queue_err != .None {
+		log.panic("game command queue create failed:", command_queue_err)
+	}
+	defer chan.destroy(game_command_queue)
+	game_command_sender = chan.as_send(game_command_queue)
+	game_command_receiver := chan.as_recv(game_command_queue)
+	sync.atomic_store(&current_server_tick, u64(0))
+
 	for i in 0 ..< options.io_threads {
 		work_queue, queue_err := chan.create_buffered(chan.Chan(^Work_Item), options.queue_size, context.allocator)
 		if queue_err != .None {
@@ -235,6 +438,13 @@ main :: proc() {
 		}
 
 		response_channels[i] = response_queue
+
+		broadcast_queue, broadcast_queue_err := chan.create_buffered(chan.Chan(^Broadcast_Shard_Message), DEFAULT_BROADCAST_QUEUE_SIZE, context.allocator)
+		if broadcast_queue_err != .None {
+			log.panic("broadcast queue create failed:", i, broadcast_queue_err)
+		}
+
+		broadcast_channels[i] = broadcast_queue
 	}
 	defer {
 		for work_queue in work_channels {
@@ -246,9 +456,13 @@ main :: proc() {
 		for response_queue in response_channels {
 			chan.destroy(response_queue)
 		}
+		for broadcast_queue in broadcast_channels {
+			chan.destroy(broadcast_queue)
+		}
 		delete(work_channels)
 		delete(accepted_channels)
 		delete(response_channels)
+		delete(broadcast_channels)
 		delete(work_queues)
 	}
 
@@ -298,6 +512,9 @@ main :: proc() {
 			accepted_receiver = chan.as_recv(accepted_channels[i]),
 			response_sender = chan.as_send(response_channels[i]),
 			response_receiver = chan.as_recv(response_channels[i]),
+			broadcast_sender = chan.as_send(broadcast_channels[i]),
+			broadcast_receiver = chan.as_recv(broadcast_channels[i]),
+			connections = make([dynamic]^Connection),
 			metrics_enabled = options.metrics,
 			metrics_interval = metrics_interval,
 			ready_sender = ready_sender,
@@ -312,6 +529,11 @@ main :: proc() {
 		)
 		if t == nil {
 			log.panic("failed to start io thread:", i)
+		}
+	}
+	defer {
+		for i in 0 ..< len(io_threads) {
+			delete(io_threads[i].connections)
 		}
 	}
 
@@ -351,11 +573,65 @@ main :: proc() {
 	}
 	nbio.accept_poly(listener, &state, on_accept)
 
+	sim := Simulation_State {
+		world = World {
+			next_player_id = 1,
+			players = make([dynamic]Player),
+			npcs = make([]NPC, NPC_COUNT),
+		},
+		future_commands = make([dynamic]Game_Command),
+		ready_commands = make([dynamic]Game_Command),
+		gameplay_commands = make([dynamic]Game_Command),
+		keep_commands = make([dynamic]bool),
+	}
+	for i in 0 ..< NPC_COUNT {
+		sim.world.npcs[i] = NPC { x = f32(i % 1000), y = f32(i / 1000) }
+	}
+	defer destroy_simulation_state(&sim)
+	server_tick: u64 = 0
+
+	tick_rate: f64 = 60.0
+	tick_duration: time.Duration = time.Duration(f64(time.Second) / tick_rate)
+	
+	stopwatch: time.Stopwatch
+	time.stopwatch_start(&stopwatch)
+	
+	accumulator: time.Duration = 0
+	last_time: time.Duration = time.stopwatch_duration(stopwatch)
+
 	for {
+		current_time: time.Duration = time.stopwatch_duration(stopwatch)
+		dt: time.Duration = current_time - last_time
+		last_time = current_time
+		
+		accumulator += dt
+		
+		simulated_this_frame := false
+		for accumulator >= tick_duration {
+			when SPALL_PROFILE {
+				profile_begin("simulation.tick")
+			}
+			run_simulation_tick(&sim, game_command_receiver, io_threads, server_tick)
+			when SPALL_PROFILE {
+				profile_end()
+			}
+			
+			accumulator -= tick_duration
+			server_tick += 1
+			sync.atomic_store(&current_server_tick, server_tick)
+			simulated_this_frame = true
+		}
+		
+		sleep_duration: time.Duration = 0
+		if accumulator < tick_duration {
+			sleep_duration = tick_duration - accumulator
+		}
+
 		when SPALL_PROFILE {
 			profile_begin("accept.tick")
 		}
-		err := nbio.tick()
+		timeout := simulated_this_frame ? time.Duration(0) : sleep_duration
+		err := nbio.tick(timeout)
 		when SPALL_PROFILE {
 			profile_end()
 		}
@@ -498,6 +774,7 @@ schedule_io_thread_task_drain :: proc(io_thread: ^IO_Thread_State) {
 drain_io_thread_queues :: proc(io_thread: ^IO_Thread_State) {
 	drain_accepted_clients(io_thread)
 	drain_responses(io_thread)
+	drain_broadcasts(io_thread)
 }
 
 drain_accepted_clients :: proc(io_thread: ^IO_Thread_State) {
@@ -541,6 +818,8 @@ assign_client_to_io_thread :: proc(io_thread: ^IO_Thread_State, accepted: ^Accep
 	connection.io_thread = accepted.io_thread
 	connection.work_sender = accepted.work_sender
 	connection.pending_lines = make([dynamic][]byte)
+	append(&io_thread.connections, connection)
+	enqueue_system_command(connection.id, .System_Connected)
 
 	log.info("client connected:", connection.source)
 	schedule_recv(connection)
@@ -567,12 +846,14 @@ work_worker :: proc(worker: ^Worker_State) {
 		when SPALL_PROFILE {
 			profile_begin("worker.process")
 		}
-		response := new(Response_Item)
+		response := alloc_response_item()
 		response.connection = work.connection
-		response.data = process_request(work.line, worker.cpu_work)
+		result := process_request(work.connection, work.line, worker.cpu_work)
+		response.data = result.data
+		response.release_only = result.release_only
 
-		delete(work.line)
-		free(work)
+		free_line_buffer(work.line)
+		free_work_item(work)
 		when SPALL_PROFILE {
 			profile_end()
 		}
@@ -625,19 +906,19 @@ enqueue_response :: proc(response: ^Response_Item) {
 	connection := response.connection
 	if connection == nil || connection.io_thread == nil {
 		delete(response.data)
-		free(response)
+		free_response_item(response)
 		return
 	}
 
 	io_thread := connection.io_thread
 	if io_thread.loop == nil {
 		delete(response.data)
-		free(response)
+		free_response_item(response)
 		return
 	}
 	if !chan.send(io_thread.response_sender, response) {
 		delete(response.data)
-		free(response)
+		free_response_item(response)
 		return
 	}
 	schedule_io_thread_task_drain(io_thread)
@@ -658,7 +939,8 @@ drain_responses :: proc(io_thread: ^IO_Thread_State) {
 io_queue_progress :: proc(io_thread: ^IO_Thread_State) -> int {
 	m := &io_thread.metrics
 	return m.accepted_tasks +
-	       m.response_tasks
+	       m.response_tasks +
+	       m.broadcast_tasks
 }
 
 io_event_progress :: proc(io_thread: ^IO_Thread_State) -> int {
@@ -666,7 +948,8 @@ io_event_progress :: proc(io_thread: ^IO_Thread_State) -> int {
 	return m.requests_dispatched +
 	       m.recv_events +
 	       m.send_events +
-	       m.responses_sent
+	       m.responses_sent +
+	       m.broadcast_sends
 }
 
 maybe_log_io_metrics :: proc(io_thread: ^IO_Thread_State) {
@@ -710,6 +993,10 @@ maybe_log_io_metrics :: proc(io_thread: ^IO_Thread_State) {
 		m.accepted_tasks,
 		"response_tasks",
 		m.response_tasks,
+		"broadcast_tasks",
+		m.broadcast_tasks,
+		"broadcast_sends",
+		m.broadcast_sends,
 		"requests_dispatched",
 		m.requests_dispatched,
 		"recv_events",
@@ -772,7 +1059,7 @@ append_received_bytes :: proc(connection: ^Connection, data: []byte) -> bool {
 
 	for b in data {
 		if b == '\n' {
-			line := make([]byte, connection.line_len)
+			line := alloc_line_buffer(connection.line_len)
 			copy(line, connection.line_buf[:connection.line_len])
 			append(&connection.pending_lines, line)
 			connection.line_len = 0
@@ -803,12 +1090,12 @@ dispatch_next_line :: proc(connection: ^Connection) {
 	}
 
 	line := connection.pending_lines[0]
-	work := new(Work_Item)
+	work := alloc_work_item()
 	work.connection = connection
 	work.line = line
 
 	if !chan.try_send(connection.work_sender, work) {
-		free(work)
+		free_work_item(work)
 		connection.waiting_for_queue = true
 		schedule_dispatch_retry(connection)
 		return
@@ -842,7 +1129,7 @@ on_dispatch_retry :: proc(op: ^nbio.Operation, connection: ^Connection) {
 	}
 }
 
-process_request :: proc(line: []byte, cpu_work: time.Duration) -> []byte {
+process_request :: proc(connection: ^Connection, line: []byte, cpu_work: time.Duration) -> Request_Result {
 	when SPALL_PROFILE {
 		profile_begin("request.process")
 	}
@@ -860,7 +1147,7 @@ process_request :: proc(line: []byte, cpu_work: time.Duration) -> []byte {
 		profile_end()
 	}
 	if err != nil {
-		return encode_json_line(shared.make_error_response(0, "invalid JSON message"))
+		return {data = encode_json_line(shared.make_error_response(0, "invalid JSON message"))}
 	}
 
 	#partial switch envelope.kind {
@@ -874,10 +1161,10 @@ process_request :: proc(line: []byte, cpu_work: time.Duration) -> []byte {
 			profile_end()
 		}
 		if err != nil {
-			return encode_json_line(shared.make_error_response(envelope.seq, "invalid world map request"))
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid world map request"))}
 		}
 		simulate_cpu_work(cpu_work)
-		return encode_json_line(shared.make_world_map_response(request.seq, ENEMY_BASES))
+		return {data = encode_json_line(shared.make_world_map_response(request.seq, ENEMY_BASES))}
 
 	case .Select_Base:
 		request: shared.Select_Base_Request
@@ -889,13 +1176,563 @@ process_request :: proc(line: []byte, cpu_work: time.Duration) -> []byte {
 			profile_end()
 		}
 		if err != nil {
-			return encode_json_line(shared.make_error_response(envelope.seq, "invalid select base request"))
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid select base request"))}
 		}
 		simulate_cpu_work(cpu_work)
-		return encode_json_line(shared.make_error_response(request.seq, "battle screen is not implemented yet"))
+		return {data = encode_json_line(shared.make_error_response(request.seq, "battle screen is not implemented yet"))}
+
+	case .Move_To:
+		request: shared.Move_To_Request
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil || connection == nil {
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid move request"))}
+		}
+		simulate_cpu_work(cpu_work)
+		command := make_gameplay_command(connection.id, request.client_seq, .Move_To)
+		command.x = request.x
+		command.y = request.y
+		if !enqueue_game_command(command) {
+			return {data = encode_json_line(shared.make_error_response(request.seq, "server command queue is full"))}
+		}
+		connection.receives_snapshots = true
+		return {release_only = true}
+
+	case .Aim:
+		request: shared.Aim_Request
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil || connection == nil {
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid aim request"))}
+		}
+		simulate_cpu_work(cpu_work)
+		command := make_gameplay_command(connection.id, request.client_seq, .Aim)
+		command.aim_angle = request.angle
+		if !enqueue_game_command(command) {
+			return {data = encode_json_line(shared.make_error_response(request.seq, "server command queue is full"))}
+		}
+		connection.receives_snapshots = true
+		return {release_only = true}
+
+	case .Shoot:
+		request: shared.Shoot_Request
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil || connection == nil {
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid shoot request"))}
+		}
+		simulate_cpu_work(cpu_work)
+		command := make_gameplay_command(connection.id, request.client_seq, .Shoot)
+		command.target_player_id = request.target_player_id
+		if !enqueue_game_command(command) {
+			return {data = encode_json_line(shared.make_error_response(request.seq, "server command queue is full"))}
+		}
+		connection.receives_snapshots = true
+		return {release_only = true}
+
+	case .Use_Item:
+		request: shared.Use_Item_Request
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil || connection == nil {
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid use item request"))}
+		}
+		simulate_cpu_work(cpu_work)
+		command := make_gameplay_command(connection.id, request.client_seq, .Use_Item)
+		command.item_id = request.item_id
+		if !enqueue_game_command(command) {
+			return {data = encode_json_line(shared.make_error_response(request.seq, "server command queue is full"))}
+		}
+		connection.receives_snapshots = true
+		return {release_only = true}
+
+	case .Buy:
+		request: shared.Buy_Request
+		when SPALL_PROFILE {
+			profile_begin("json.decode_request")
+		}
+		err := shared.decode_json(line, &request)
+		when SPALL_PROFILE {
+			profile_end()
+		}
+		if err != nil || connection == nil {
+			return {data = encode_json_line(shared.make_error_response(envelope.seq, "invalid buy request"))}
+		}
+		simulate_cpu_work(cpu_work)
+		command := make_gameplay_command(connection.id, request.client_seq, .Buy)
+		command.product_id = request.product_id
+		if !enqueue_game_command(command) {
+			return {data = encode_json_line(shared.make_error_response(request.seq, "server command queue is full"))}
+		}
+		connection.receives_snapshots = true
+		return {release_only = true}
 
 	case:
-		return encode_json_line(shared.make_error_response(envelope.seq, "unknown message kind"))
+		return {data = encode_json_line(shared.make_error_response(envelope.seq, "unknown message kind"))}
+	}
+}
+
+make_gameplay_command :: proc(connection_id: u64, client_seq: u32, kind: shared.Command_Kind) -> Game_Command {
+	return Game_Command {
+		connection_id = connection_id,
+		client_seq = client_seq,
+		recv_tick = sync.atomic_load(&current_server_tick),
+		kind = kind,
+	}
+}
+
+enqueue_system_command :: proc(connection_id: u64, kind: shared.Command_Kind) {
+	command := Game_Command {
+		connection_id = connection_id,
+		recv_tick = sync.atomic_load(&current_server_tick),
+		kind = kind,
+	}
+	if !enqueue_game_command(command) {
+		log.warn("game command queue full; dropping system command", "connection_id", connection_id, "kind", kind)
+	}
+}
+
+enqueue_game_command :: proc(command: Game_Command) -> bool {
+	command_ptr := alloc_game_command()
+	command_ptr^ = command
+	command_ptr.is_pooled = true
+	if !chan.try_send(game_command_sender, command_ptr) {
+		free_game_command(command_ptr)
+		return false
+	}
+	return true
+}
+
+destroy_simulation_state :: proc(sim: ^Simulation_State) {
+	delete(sim.world.players)
+	delete(sim.world.npcs)
+	delete(sim.future_commands)
+	delete(sim.ready_commands)
+	delete(sim.gameplay_commands)
+	delete(sim.keep_commands)
+}
+
+run_simulation_tick :: proc(sim: ^Simulation_State, command_receiver: chan.Chan(^Game_Command, .Recv), io_threads: []IO_Thread_State, server_tick: u64) {
+	resize(&sim.ready_commands, 0)
+	resize(&sim.gameplay_commands, 0)
+
+	pull_ready_future_commands(sim, server_tick)
+	drain_game_command_queue(sim, command_receiver, server_tick)
+	process_system_commands(sim)
+	process_gameplay_commands(sim)
+	simulate_world(sim, server_tick)
+
+	if should_broadcast_world(&sim.world, server_tick) {
+		broadcast_world_snapshot(&sim.world, io_threads, server_tick)
+	}
+}
+
+simulate_world :: proc(sim: ^Simulation_State, server_tick: u64) {
+	tick_f := f32(server_tick)
+	for i in 0 ..< len(sim.world.npcs) {
+		i_f := f32(i)
+		sim.world.npcs[i].x += math.sin(tick_f * 0.01 + i_f) * 0.1
+		sim.world.npcs[i].y += math.cos(tick_f * 0.01 + i_f) * 0.1
+	}
+}
+
+drain_game_command_queue :: proc(sim: ^Simulation_State, receiver: chan.Chan(^Game_Command, .Recv), server_tick: u64) {
+	for _ in 0 ..< MAX_TOTAL_COMMANDS_PER_TICK {
+		command_ptr, ok := chan.try_recv(receiver)
+		if !ok {
+			return
+		}
+
+		command := command_ptr^
+		free_game_command(command_ptr)
+		stage_command_for_tick(sim, command, server_tick)
+	}
+}
+
+pull_ready_future_commands :: proc(sim: ^Simulation_State, server_tick: u64) {
+	i := 0
+	for i < len(sim.future_commands) {
+		command := sim.future_commands[i]
+		if command.target_tick > server_tick {
+			i += 1
+			continue
+		}
+
+		remove_future_command_at(sim, i)
+		if !is_stale_gameplay_command(command, server_tick) {
+			append_ready_command(sim, command)
+		}
+	}
+}
+
+stage_command_for_tick :: proc(sim: ^Simulation_State, command: Game_Command, server_tick: u64) {
+	staged := command
+	staged.target_tick = command_target_tick(staged)
+	if is_system_command(staged.kind) {
+		append_ready_command(sim, staged)
+		return
+	}
+
+	if staged.target_tick > server_tick {
+		store_future_command(sim, staged)
+		return
+	}
+	if is_stale_gameplay_command(staged, server_tick) {
+		return
+	}
+	append_ready_command(sim, staged)
+}
+
+command_target_tick :: proc(command: Game_Command) -> u64 {
+	if is_system_command(command.kind) {
+		return command.recv_tick
+	}
+	return command.recv_tick + INPUT_DELAY_TICKS
+}
+
+append_ready_command :: proc(sim: ^Simulation_State, command: Game_Command) -> bool {
+	if !is_system_command(command.kind) && len(sim.ready_commands) >= MAX_TOTAL_COMMANDS_PER_TICK {
+		return false
+	}
+	append(&sim.ready_commands, command)
+	return true
+}
+
+store_future_command :: proc(sim: ^Simulation_State, command: Game_Command) -> bool {
+	if len(sim.future_commands) >= MAX_FUTURE_COMMANDS {
+		return false
+	}
+	count := 0
+	for future in sim.future_commands {
+		if future.connection_id == command.connection_id {
+			count += 1
+		}
+	}
+	if count >= MAX_FUTURE_COMMANDS_PER_CONNECTION {
+		return false
+	}
+	append(&sim.future_commands, command)
+	return true
+}
+
+remove_future_command_at :: proc(sim: ^Simulation_State, index: int) {
+	last := len(sim.future_commands) - 1
+	for i in index ..< last {
+		sim.future_commands[i] = sim.future_commands[i + 1]
+	}
+	resize(&sim.future_commands, last)
+}
+
+is_stale_gameplay_command :: proc(command: Game_Command, server_tick: u64) -> bool {
+	if command.target_tick >= server_tick {
+		return false
+	}
+	return server_tick - command.target_tick > MAX_STALE_TICKS
+}
+
+process_system_commands :: proc(sim: ^Simulation_State) {
+	for command in sim.ready_commands {
+		#partial switch command.kind {
+		case .System_Connected:
+			add_player_for_connection(&sim.world, command.connection_id)
+		case .System_Disconnected:
+			remove_player_for_connection(&sim.world, command.connection_id)
+		case:
+		}
+	}
+}
+
+process_gameplay_commands :: proc(sim: ^Simulation_State) {
+	for command in sim.ready_commands {
+		if !is_system_command(command.kind) {
+			append(&sim.gameplay_commands, command)
+		}
+	}
+
+	sort_gameplay_commands(sim.gameplay_commands[:])
+	mark_coalesced_commands(sim)
+	for command, i in sim.gameplay_commands {
+		if sim.keep_commands[i] {
+			apply_gameplay_command(&sim.world, command)
+		}
+	}
+}
+
+sort_gameplay_commands :: proc(commands: []Game_Command) {
+	for i in 1 ..< len(commands) {
+		key := commands[i]
+		j := i
+		for j > 0 && game_command_less(key, commands[j - 1]) {
+			commands[j] = commands[j - 1]
+			j -= 1
+		}
+		commands[j] = key
+	}
+}
+
+game_command_less :: proc(a, b: Game_Command) -> bool {
+	if a.target_tick != b.target_tick {
+		return a.target_tick < b.target_tick
+	}
+	if a.connection_id != b.connection_id {
+		return a.connection_id < b.connection_id
+	}
+	return a.client_seq < b.client_seq
+}
+
+mark_coalesced_commands :: proc(sim: ^Simulation_State) {
+	resize(&sim.keep_commands, len(sim.gameplay_commands))
+	for i in 0 ..< len(sim.keep_commands) {
+		sim.keep_commands[i] = true
+	}
+
+	for command, i in sim.gameplay_commands {
+		if !is_continuous_command(command.kind) {
+			continue
+		}
+		for other, j in sim.gameplay_commands {
+			if j <= i || !is_continuous_command(other.kind) {
+				continue
+			}
+			if other.connection_id == command.connection_id && other.kind == command.kind && other.client_seq > command.client_seq {
+				sim.keep_commands[i] = false
+				break
+			}
+		}
+	}
+}
+
+apply_gameplay_command :: proc(world: ^World, command: Game_Command) {
+	player := find_player_by_connection_id(world, command.connection_id)
+	if player == nil {
+		return
+	}
+	if command.client_seq <= player.last_client_seq {
+		return
+	}
+
+	player.last_client_seq = command.client_seq
+	player.subscribed = true
+	#partial switch command.kind {
+	case .Move_To:
+		player.x = command.x
+		player.y = command.y
+	case .Aim:
+		player.aim_angle = command.aim_angle
+	case .Shoot:
+		// TODO: validate cooldowns/range/ammo before applying combat.
+	case .Use_Item:
+		// TODO: validate ownership/cooldowns before applying item effects.
+	case .Buy:
+		// TODO: validate economy rules before applying purchases.
+	case:
+	}
+}
+
+is_system_command :: proc(kind: shared.Command_Kind) -> bool {
+	return kind == .System_Connected || kind == .System_Disconnected
+}
+
+is_continuous_command :: proc(kind: shared.Command_Kind) -> bool {
+	return kind == .Move_To || kind == .Aim
+}
+
+add_player_for_connection :: proc(world: ^World, connection_id: u64) {
+	if find_player_by_connection_id(world, connection_id) != nil {
+		return
+	}
+
+	player := Player {
+		id = world.next_player_id,
+		connection_id = connection_id,
+		x = 120 + f32(len(world.players)) * 32,
+		y = 120,
+	}
+	world.next_player_id += 1
+	append(&world.players, player)
+}
+
+remove_player_for_connection :: proc(world: ^World, connection_id: u64) {
+	for player, i in world.players {
+		if player.connection_id != connection_id {
+			continue
+		}
+		last := len(world.players) - 1
+		for j in i ..< last {
+			world.players[j] = world.players[j + 1]
+		}
+		resize(&world.players, last)
+		return
+	}
+}
+
+find_player_by_connection_id :: proc(world: ^World, connection_id: u64) -> ^Player {
+	for &player in world.players {
+		if player.connection_id == connection_id {
+			return &player
+		}
+	}
+	return nil
+}
+
+should_broadcast_world :: proc(world: ^World, server_tick: u64) -> bool {
+	if server_tick % BROADCAST_INTERVAL_TICKS != 0 {
+		return false
+	}
+	for player in world.players {
+		if player.subscribed {
+			return true
+		}
+	}
+	return false
+}
+
+broadcast_world_snapshot :: proc(world: ^World, io_threads: []IO_Thread_State, server_tick: u64) {
+	master := encode_world_snapshot(world, server_tick)
+	if master == nil {
+		return
+	}
+
+	// Count reachable shards first so we can set remaining_sends accurately.
+	reachable := 0
+	for i in 0 ..< len(io_threads) {
+		if io_threads[i].loop != nil {
+			reachable += 1
+		}
+	}
+	if reachable == 0 {
+		delete(master)
+		return
+	}
+
+	message := new(Broadcast_Shard_Message)
+	message.data = master
+	sync.atomic_store(&message.remaining_sends, reachable)
+
+	for i in 0 ..< len(io_threads) {
+		io_thread := &io_threads[i]
+		if io_thread.loop == nil {
+			continue
+		}
+		if !chan.try_send(io_thread.broadcast_sender, message) {
+			// Shard queue full — decrement our pre-counted ref.
+			if sync.atomic_sub(&message.remaining_sends, 1) == 1 {
+				delete(message.data)
+				free(message)
+			}
+			continue
+		}
+		schedule_io_thread_task_drain(io_thread)
+	}
+}
+
+encode_world_snapshot :: proc(world: ^World, server_tick: u64) -> []byte {
+	players := make([]shared.Player_Snapshot, len(world.players))
+	defer delete(players)
+	for player, i in world.players {
+		players[i] = shared.Player_Snapshot {
+			player_id = player.id,
+			connection_id = player.connection_id,
+			x = player.x,
+			y = player.y,
+			aim_angle = player.aim_angle,
+		}
+	}
+
+	snapshot := shared.make_world_snapshot_response(0, server_tick, players)
+	return encode_json_line(snapshot)
+}
+
+drain_broadcasts :: proc(io_thread: ^IO_Thread_State) {
+	for {
+		message, ok := chan.try_recv(io_thread.broadcast_receiver)
+		if !ok {
+			return
+		}
+
+		io_thread.metrics.broadcast_tasks += 1
+		schedule_broadcast_message(io_thread, message)
+	}
+}
+
+schedule_broadcast_message :: proc(io_thread: ^IO_Thread_State, message: ^Broadcast_Shard_Message) {
+	if message == nil || message.data == nil {
+		if message != nil {
+			free(message)
+		}
+		return
+	}
+
+	// Count eligible targets first (no allocation needed).
+	target_count := 0
+	for connection in io_thread.connections {
+		if connection != nil && !connection.closed && !connection.busy && connection.receives_snapshots {
+			target_count += 1
+		}
+	}
+
+	if target_count == 0 {
+		delete(message.data)
+		free(message)
+		return
+	}
+
+	sync.atomic_store(&message.remaining_sends, target_count)
+	io_thread.metrics.broadcast_sends += target_count
+	for connection in io_thread.connections {
+		if connection != nil && !connection.closed && !connection.busy && connection.receives_snapshots {
+			nbio.send_poly(connection.socket, {message.data}, message, on_broadcast_sent, l=connection.loop)
+		}
+	}
+}
+
+on_broadcast_sent :: proc(op: ^nbio.Operation, message: ^Broadcast_Shard_Message) {
+	if message == nil {
+		return
+	}
+	if op.send.err != nil {
+		log.warn("broadcast send failed:", op.send.err)
+	}
+	if sync.atomic_sub(&message.remaining_sends, 1) == 1 {
+		delete(message.data)
+		free(message)
+	}
+}
+
+remove_io_connection :: proc(io_thread: ^IO_Thread_State, connection: ^Connection) {
+	if io_thread == nil || connection == nil {
+		return
+	}
+	for candidate, i in io_thread.connections {
+		if candidate != connection {
+			continue
+		}
+		last := len(io_thread.connections) - 1
+		for j in i ..< last {
+			io_thread.connections[j] = io_thread.connections[j + 1]
+		}
+		resize(&io_thread.connections, last)
+		return
 	}
 }
 
@@ -943,16 +1780,15 @@ encode_json_line :: proc(message: any) -> []byte {
 		}
 	}
 
-	data, err := shared.encode_json(message)
-	if err != nil {
+	b: strings.Builder
+	strings.builder_init(&b)
+	opt := shared.JSON_OPTIONS
+	if err := json.marshal_to_builder(&b, message, &opt); err != nil {
+		strings.builder_destroy(&b)
 		return nil
 	}
-	defer delete(data)
-
-	line := make([]byte, len(data) + 1)
-	copy(line, data)
-	line[len(data)] = '\n'
-	return line
+	strings.write_byte(&b, '\n')
+	return b.buf[:]
 }
 
 on_response_ready :: proc(response: ^Response_Item) {
@@ -965,13 +1801,29 @@ on_response_ready :: proc(response: ^Response_Item) {
 		}
 	}
 
+	if response == nil {
+		return
+	}
+
 	connection := response.connection
-	if connection.closed || response.data == nil {
+	if connection == nil {
 		delete(response.data)
-		free(response)
-		if connection != nil && !connection.closed {
-			close_connection(connection)
-		}
+		free_response_item(response)
+		return
+	}
+	if connection.closed {
+		delete(response.data)
+		free_response_item(response)
+		return
+	}
+	if response.release_only {
+		free_response_item(response)
+		complete_connection_request(connection)
+		return
+	}
+	if response.data == nil {
+		free_response_item(response)
+		close_connection(connection)
 		return
 	}
 
@@ -990,7 +1842,7 @@ on_sent :: proc(op: ^nbio.Operation, response: ^Response_Item) {
 
 	connection := response.connection
 	delete(response.data)
-	free(response)
+	free_response_item(response)
 
 	if connection.closed {
 		return
@@ -1003,6 +1855,14 @@ on_sent :: proc(op: ^nbio.Operation, response: ^Response_Item) {
 	}
 
 	connection.io_thread.metrics.responses_sent += 1
+	complete_connection_request(connection)
+}
+
+complete_connection_request :: proc(connection: ^Connection) {
+	if connection == nil || connection.closed {
+		return
+	}
+
 	connection.busy = false
 	dispatch_next_line(connection)
 	if !connection.closed && !connection.busy {
@@ -1025,10 +1885,12 @@ close_connection :: proc(connection: ^Connection) {
 	}
 
 	connection.closed = true
+	enqueue_system_command(connection.id, .System_Disconnected)
 	for line in connection.pending_lines {
-		delete(line)
+		free_line_buffer(line)
 	}
 	delete(connection.pending_lines)
+	remove_io_connection(connection.io_thread, connection)
 	nbio.close(connection.socket)
 	log.info("client disconnected")
 	free(connection)

@@ -2,3 +2,11 @@
 /bin
 *.spall
 /profiles/
+.DS_Store
+/server.log
+/server-rust/target/
+/.zig-cache/
+/zig-out/
+/test
+/test_posix
+/test_posix_system
